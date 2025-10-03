@@ -5,7 +5,14 @@ class GRUModel(nn.Module):
     def __init__(self, input_size=5, hidden_size=64, num_layers=2, output_layer=1, dropout=0.2):
         super(GRUModel, self).__init__()
         
-        self.feature_net = nn.Sequential(
+        self.price_feature_net = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.direction_feature_net = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
@@ -21,31 +28,61 @@ class GRUModel(nn.Module):
             bidirectional=True
         )
         
-        self.attention = nn.Sequential(
+        self.price_attention = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.Tanh(),
             nn.Linear(hidden_size, 1, bias=False)
         )
         
-        self.output_net = nn.Sequential(
+        self.direction_attention = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1, bias=False)
+        )
+        
+        self.price_head = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 64),
+            nn.Linear(hidden_size, 32),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(32, 1)  # Predict price change
+        )
+        
+        self.direction_head = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),  # Predict direction: up, down, or flat
         )
 
 
     def forward(self, x):
-        x = self.feature_net(x)
-        gru_out, _ = self.gru(x)
+        # Process features separately
+        price_features = self.price_feature_net(x)
+        direction_features = self.direction_feature_net(x)
         
-        attn_weights = torch.softmax(
-            self.attention(gru_out), dim=1
+        # Shared GRU processing
+        price_gru_out, _ = self.gru(price_features)
+        direction_gru_out, _ = self.gru(direction_features)
+        
+        # Attention mechanisms
+        price_attn_weights = torch.softmax(
+            self.price_attention(price_gru_out), dim=1
         )
+        price_context = torch.sum(price_attn_weights * price_gru_out, dim=1)
         
-        context = torch.sum(attn_weights * gru_out, dim=1)
+        direction_attn_weights = torch.softmax(
+            self.direction_attention(direction_gru_out), dim=1
+        )
+        direction_context = torch.sum(direction_attn_weights * direction_gru_out, dim=1)
         
-        return self.output_net(context)
+        # Output predictions
+        price_change = self.price_head(price_context)
+        direction_logit = self.direction_head(direction_context)
+        
+        return price_change, direction_logit
