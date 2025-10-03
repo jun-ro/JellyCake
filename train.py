@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler # type: ignore
 from model import GRUModel
 from tqdm import tqdm
+import torch.nn.functional as F
 import pickle
 from loader import BTCDataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -13,7 +14,7 @@ import matplotlib.pyplot as plt  # For diagnostics
 # Variables
 Epochs = 20  # Start small for testing
 patience = 5
-Output_file = "model/model.pth"
+Output_file = "model/upgraded_model.pth"
 Learning_rate = 0.001
 Max_rows = 500_000  # Your bull run subset
 
@@ -36,35 +37,30 @@ train_loader, test_loader = data_loader.get_dataloaders(
 )
 print(f'Train batches: {len(train_loader)} | Test batches: {len(test_loader)}')
 
-# Diagnostics to verify data
-def run_diagnostics(data_loader):
-    print('\n=== DIAGNOSTICS ===')
-    df = data_loader.df
-    print(f'Rows: {len(df)}, Date range: {df["Datetime"].min()} to {df["Datetime"].max()}')
-    print(f'Price range: ${df["Low"].min():.2f} - ${df["High"].max():.2f}')
-    print(f'Std Close: ${df["Close"].std():.2f}')
-    changes = df["Close"].diff().dropna()
-    change_pct = len(changes[changes != 0]) / len(changes) * 100
-    print(f'Price changes (% non-zero): {change_pct:.1f}%')
-    # Quick plot
-    plt.figure(figsize=(10, 4))
-    sample = df.tail(5000)['Close']
-    plt.plot(sample)
-    plt.title('Sample Close Prices')
-    plt.savefig('diagnostics_plot.png')
-    plt.close()
-    print('Plot saved as diagnostics_plot.png')
-
-run_diagnostics(data_loader)
-
 # Model
 model = GRUModel(input_size=5, hidden_size=64, num_layers=2)
 model.to(device)
 
+## Improved Loss Function
+
+class DualLoss(nn.Module):
+    def __init__(self, price_weight=0.7, direction_weight=0.3):
+        super().__init__()
+        self.price_weight = price_weight
+        self.direction_weight = direction_weight
+        self.mse = nn.MSELoss()
+        self.ce = nn.CrossEntropyLoss()
+    
+    def forward(self, price_pred, direction_pred, price_target, direction_target):
+        price_loss = self.mse(price_pred, price_target)
+        direction_loss = self.ce(direction_pred, direction_target)
+        
+        return self.price_weight * price_loss + self.direction_weight * direction_loss
+
 def train():
-    criterion = nn.MSELoss()
+    criterion = DualLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=Learning_rate)
-    scaler = GradScaler('cuda')  # AMP scaler
+    scaler = GradScaler('cuda')
     
     best_loss = float('inf')
     patience_counter = 0
@@ -72,29 +68,52 @@ def train():
     for epoch in range(Epochs):
         model.train()
         total_loss = 0
+        price_loss_total = 0
+        direction_loss_total = 0
+        
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{Epochs}')
         
-        for batch_X, batch_y in progress_bar:
+        for batch_X, (batch_y_price, batch_y_direction) in progress_bar:
             batch_X = batch_X.to(device)
-            batch_y = batch_y.to(device)
+            batch_y_price = batch_y_price.to(device)
+            batch_y_direction = batch_y_direction.to(device)
             
-            optimizer.zero_grad()  # Clear BEFORE forward (fix #1)
+            optimizer.zero_grad()
             
-            with autocast('cuda'):  # FP16 forward (no duplicate)
-                predictions = model(batch_X)
-                loss = criterion(predictions, batch_y)
+            with autocast('cuda'):
+                price_pred, direction_pred = model(batch_X)
+                loss = criterion(price_pred, direction_pred, batch_y_price, batch_y_direction)
+                
+                # Calculate individual losses for reporting
+                price_loss = criterion.mse(price_pred, batch_y_price)
+                direction_loss = criterion.ce(direction_pred, batch_y_direction)
             
-            # AMP backward (fix #2: No duplicate loss)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
             total_loss += loss.item()
-            progress_bar.set_postfix({'Loss': f'{loss.item():.4f}'})
+            price_loss_total += price_loss.item()
+            direction_loss_total += direction_loss.item()
+            
+            progress_bar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Price': f'{price_loss.item():.4f}',
+                'Dir': f'{direction_loss.item():.4f}'
+            })
         
         avg_loss = total_loss / len(train_loader)
-        print(f'Epoch [{epoch+1}/{Epochs}] Complete - Avg Loss: {avg_loss:.4f}')
+        avg_price_loss = price_loss_total / len(train_loader)
+        avg_direction_loss = direction_loss_total / len(train_loader)
         
+        print(f'Epoch [{epoch+1}/{Epochs}] Complete')
+        print(f'  Total Loss: {avg_loss:.4f}')
+        print(f'  Price Loss: {avg_price_loss:.4f}')
+        print(f'  Direction Loss: {avg_direction_loss:.4f}')
+        
+        # Early stopping logic
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
@@ -104,78 +123,6 @@ def train():
             if patience_counter >= patience:
                 print(f'Early stopping at epoch {epoch+1}')
                 break
-    
-    print(f'Final best loss: {best_loss:.4f}')
-
-def quick_eval(model, data_loader, device):
-    """Corrected eval for delta model"""
-    model.eval()
-    all_preds, all_targets = [], []
-    
-    with torch.no_grad():
-        for batch_X, batch_y in test_loader:
-            batch_X = batch_X.to(device)
-            batch_y = batch_y.to(device)
-            with autocast('cuda'):
-                preds = model(batch_X)
-            all_preds.append(preds.cpu().numpy().flatten())
-            all_targets.append(batch_y.cpu().numpy().flatten())
-    
-    predictions = np.concatenate(all_preds)
-    targets = np.concatenate(all_targets)
-    
-    # Inverse deltas (using y_scaler)
-    pred_delta = data_loader.inverse_transform_predictions(predictions, is_delta=True)
-    target_delta = data_loader.inverse_transform_predictions(targets, is_delta=True)
-    
-    # Reconstruct full prices (key fix: add delta to previous close)
-    # Get test part of df (approximate: after train split + seq_length offset)
-    test_start_idx = len(data_loader.X_train.shape[0]) + data_loader.seq_length - 1  # Adjust for sequences
-    test_df = data_loader.df.iloc[test_start_idx:].reset_index(drop=True)
-    previous_closes = test_df['Close'].values[:-1]  # Previous for each test prediction
-    full_targets = previous_closes + target_delta
-    full_predictions = previous_closes + pred_delta
-    
-    # Metrics on full prices
-    mae_full = mean_absolute_error(full_targets, full_predictions)
-    rmse_full = np.sqrt(mean_squared_error(full_targets, full_predictions))
-    r2_full = r2_score(full_targets, full_predictions)
-    
-    # Metrics on deltas (change error)
-    mae_delta = mean_absolute_error(target_delta, pred_delta)
-    rmse_delta = np.sqrt(mean_squared_error(target_delta, pred_delta))
-    r2_delta = r2_score(target_delta, pred_delta)
-    
-    # Baseline delta (assume 0 change = previous price)
-    baseline_mae = np.mean(np.abs(target_delta))  # Average |actual delta|
-    
-    # Directional accuracy (up/down correct)
-    dir_actual = np.sign(target_delta)  # +1 up, -1 down, 0 flat
-    dir_pred = np.sign(pred_delta)
-    dir_acc = np.mean(dir_actual == dir_pred) * 100
-    
-    print(f'\n=== QUICK EVAL (DELTA MODEL) ===')
-    print(f'Full Prices Metrics:')
-    print(f'  MAE: ${mae_full:.2f} | RMSE: ${rmse_full:.2f} | R²: {r2_full:.4f}')
-    print(f'Delta Change Metrics:')
-    print(f'  MAE: ${mae_delta:.2f} | RMSE: ${rmse_delta:.2f} | R²: {r2_delta:.4f}')
-    print(f'Baseline Delta MAE: ${baseline_mae:.2f} ({"✓ Beats" if mae_delta < baseline_mae else "✗ Worse"} by ${abs(baseline_mae - mae_delta):.2f})')
-    print(f'Directional Accuracy (Up/Down Correct): {dir_acc:.1f}% (random = 50%)')
-    
-    # Save corrected CSV
-    results_df = pd.DataFrame({
-        'Previous_Close': previous_closes,
-        'Predicted_Delta': pred_delta,
-        'Actual_Delta': target_delta,
-        'Predicted_Full': full_predictions,
-        'Actual_Full': full_targets,
-        'Error_Full': full_targets - full_predictions,
-        'Dir_Correct': (dir_actual == dir_pred).astype(int)
-    })
-    results_df.to_csv('delta_eval_results.csv', index=False)
-    print(f'Saved to delta_eval_results.csv ({len(results_df)} rows)')
-    
-    return mae_full, rmse_full, r2_full, mae_delta, dir_acc
 
 def save_model(model, filepath=Output_file):
     torch.save({
@@ -184,14 +131,19 @@ def save_model(model, filepath=Output_file):
     }, filepath)
     print(f'Model saved to {filepath}')
 
-def save_scaler(scaler, filepath='model/scaler.pkl'):
-    with open(filepath, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f'Scaler saved to {filepath}')
+def save_scalers(data_loader, x_path='model/scaler.pkl', y_path='model/y_scaler.pkl'):
+    # Save input scaler
+    with open(x_path, 'wb') as f:
+        pickle.dump(data_loader.scaler, f)
+    print(f'Input scaler saved to {x_path}')
+
+    # Save y (delta) scaler if present
+    if hasattr(data_loader, 'y_scaler'):
+        with open(y_path, 'wb') as f:
+            pickle.dump(data_loader.y_scaler, f)
+        print(f'Y (delta) scaler saved to {y_path}')
 
 # Run
 train()
 save_model(model)
-save_scaler(data_loader.scaler)
-mae, rmse, r2 = quick_eval(model, data_loader, device)
-print(f'Complete! MAE=${mae:.2f}, R²={r2:.4f}')
+save_scalers(data_loader)
