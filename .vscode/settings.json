@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "/f/StupidProjects/JellyCake/.venv/Scripts/python",  // e.g., "/usr/bin/python3"
+    "python.languageServer": "Pylance",  // Ensure Pylance is used
+    "python.analysis.typeCheckingMode": "basic",  // Or "strict" for more checking
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true  // Optional: for linting
+}
